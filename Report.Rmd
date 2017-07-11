@@ -1,0 +1,597 @@
+---
+title: "Using Gradient Boosting and Regularization to Predict Housing Prices (Kaggle)"
+author: "Saeed Nusri"
+date: "7/7/2017"
+output: html_document
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(cache=TRUE)
+```
+#Introduction
+
+This report presents the analysis and modeling done on the House Pricing dataset provided on Kaggle for advanced regression technique.
+
+The goal of this report is to show how the data was transformed into numeric for appropria , while preserving as much information from the categoric variables as we’re going to use a gradient boosting method (XGBoost). As XGBoost has trouble with extrapolation so ridge, lasso and elastic-net regularization, which will also account for a lot of the multicollinearity in the data, will be used. Once predictions from all 4 regressors have been made an average of the results will be taken to get final prediction. 
+
+
+#Data Wrangling
+
+##Missing Values - MICE Imputations
+
+The training and testing data is loaded and combined together for data wrangling. The training data consists of 1460 rows and 81 columns while the testing has 1459 rows and 80 columns (excluding the SalePrice column), which in this dataset is the dependent variable we are trying to predict. To perform analysis at a more productive rate the 2 dataframes are first combined for engineering the features, then split the data once we are ready to train a model.
+
+The Id feature is removed because it does not contribute to the the modeling and SalePrice being the response variable is not included either. We also won’t import string variables as factors since our ultimate goal is to tranform all our variables to numeric.
+
+
+```{r loading libraries, include=TRUE, warning=FALSE, message=FALSE}
+library(ggplot2)
+library(dplyr)
+library(Amelia)
+library(varhandle)
+library(stringr)
+library(caret)
+library(moments)
+library(mice)
+library(corrplot)
+library(randomForest)
+library(gridExtra)
+library(xgboost)
+library(glmnet)
+
+train <- read.csv("train.csv")
+test <- read.csv("test.csv")
+
+train_row <- nrow(train)
+test_row <- nrow(test)
+
+comb_data <- rbind(within(train, rm('Id','SalePrice')), within(test, rm('Id')))
+```
+
+
+Firstly, missing values are dealt with using MICE imputation with predictive mean matching (PMM) method. PMM imputation provides one of the best and quick ways of filling in the missing data. it is a well-known and widely used method for generating hot-deck imputations, which imputes missing values by means of the nearest-neighbor donor with distance based on the expected values of
+the missing variables conditional on the observed covariates.
+
+
+
+```{r NASUMS, message = FALSE}
+
+#Calculating the number of missing values for each variable
+NA_sum <- sort(sapply(comb_data, function(x) sum(is.na(x))), decreasing = TRUE)
+print(NA_sum) 
+
+
+missmap(comb_data, col = c("black", "White"), 
+        main = "Missing Data", rank.order = T,
+        y.labels = F, y.at = F, legend = F, tsvar = T)
+
+```
+
+```{r MICE, message=FALSE, warning=FALSE, include=FALSE, cache=TRUE}
+#Running MICE imputation with PMM on the columns that had null values. This is reduce computation time.
+ 
+mice_mod <- mice(comb_data[, colnames(comb_data) %in% c('LotFrontage',
+                                                          'Alley','BsmtQual',' BsmtCond',
+                                                          'BsmtExposure','BsmtFinType1',
+                                                          'BsmtFinType2', 'Electrical',
+                                                          'FireplaceQu','GarageType', 
+                                                          'GarageYrBlt','GarageFinish', 
+                                                          'PoolQC','Fence', 'MiscFeature', 
+                                                          'PoolQC','Fence', 'MasVnrType',
+                                                          'BsmtCond', 'GarageQual',
+                                                          'GarageCond', "MasVnrArea", "MSZoning",
+                                                          "Utilities", "BsmtFullBath",
+                                                          "MSZoning", 'BsmtHalfBath', 'Functional',
+                                                          'Exterior1st', 'Exterior2nd','BsmtFinSF1',
+                                                          'BsmtFinSF2', 'BsmtUnfSf', 'TotalBsmtSF',
+                                                          'Electrical', 'KitchenQual', 'GarageCars',
+                                                          'GarageArea', 'SaleType',
+                                                        'BsmtUnfSF')], method = "pmm")
+
+complete_pmm <- complete(mice_mod)
+
+#Recombining the imputed values with the rest of the data
+sim_col <- match(colnames(complete_pmm), colnames(comb_data))
+comb_data <- comb_data[,-sim_col]
+
+
+comb_data <- cbind(comb_data, complete_pmm)
+
+print(NA_sum)
+```
+
+```{r Amelia}
+
+missmap(comb_data, col = c("black", "White"), 
+        main = "Missing Data", rank.order = T,
+        y.labels = F, y.at = F, legend = F, tsvar = T)
+
+```
+
+
+##Feature Engineering 
+
+The first step in feature engineering is to separate the numeric variables in a separate dataset. Once separated, the categoric variables are hotencoded into the dataset.
+
+
+```{r  numericdat , message = FALSE}
+
+numeric <- sapply(comb_data, is.numeric)
+
+print(numeric)
+
+numeric_dat <- comb_data[,numeric==TRUE]
+
+```
+
+A function is created to plot the categoric variable and another to hotencode. Hence, train dataset is grouped back to get the relationship between the SalePrice and levels of the categoric variable. This would evetually help with numerically labeling the ordinal variables. 
+
+```{r funtion_hotencode}
+
+# function that groups a column by its features and returns the mdedian saleprice for each unique feature. 
+
+group_df <- comb_data[1:1460,]
+group_df$SalePrice <- train$SalePrice
+
+group.prices <- function(col) { 
+        group.table <- group_df[,c(col, 'SalePrice', 'OverallQual')] %>%
+                group_by_(col) %>% 
+                summarise(mean.Quality = round(mean(OverallQual),2),
+                          mean.Price = mean(SalePrice), n = n()) %>%
+                arrange(mean.Quality)
+    
+  print(qplot(x=reorder(group.table[[col]], -group.table[['mean.Price']]),
+              y=group.table[['mean.Price']]) +
+                geom_bar(stat='identity', fill='blue') +
+                theme_minimal() +
+                scale_y_continuous() + 
+                labs(x=col, y='Mean SalePrice') + 
+                theme(axis.text.x = element_text(angle = 45)))
+  
+  return(data.frame(group.table))
+}
+
+
+hotencode <- function(column, dum.vars, dataframe) {
+        for(col in column){
+                dataframe[col] <- as.numeric(dum.vars[comb_data[,col]])
+        }
+        return(dataframe)
+}
+
+```
+
+```{r grouping}
+
+#The following code plots the categorical variables agaisnt mean SalePrice
+#Then the variables are hot encoded ordinally
+
+group.prices('FireplaceQu')
+group.prices('BsmtQual')
+group.prices('KitchenQual')
+group.prices('GarageCond')
+group.prices('HeatingQC')
+
+
+qual_column <- c('ExterQual', 'ExterCond', 'GarageQual', 
+               'GarageCond', 'FireplaceQu', 'KitchenQual', 
+               'HeatingQC', 'BsmtQual')
+
+qual_list <- c('None' = 0, 'Po' = 1, 'Fa' = 2, 'TA' = 3, 'Gd' = 4, 'Ex' = 5)
+numeric_dat <- hotencode(qual_column, qual_list, numeric_dat)
+
+
+group.prices('BsmtExposure')
+
+bsmt_list <- c('None' = 0, 'No' = 1, 'Mn' = 2, 'Av' = 3, 'Gd' = 4)
+numeric_dat <-hotencode(c("BsmtExposure"), bsmt_list, numeric_dat)
+
+group.prices('BsmtFinType1')
+bsmtFin_list <- c('None' = 0, 'Unf' = 1, 'LwQ' = 2,
+                   'Rec'= 3, 'BLQ' = 4, 'ALQ' = 5, 'GLQ' = 6)
+numeric_dat <- hotencode(c('BsmtFinType1','BsmtFinType2'), bsmtFin_list, numeric_dat)
+
+group.prices('Functional')
+
+functional_list <- c('None' = 0, 'Sal' = 1, 'Sev' = 2, 'Maj2' = 3, 'Maj1' = 4,
+                     'Mod' = 5, 'Min2' = 6, 'Min1' = 7, 'Typ'= 8)
+numeric_dat['Functional'] <- as.numeric(functional_list[comb_data$Functional])
+
+group.prices('Fence')
+
+fence_list <- c('None' = 0, 'MnWw' = 1, 'GdWo' = 1, 'MnPrv' = 2, 'GdPrv' = 4)
+numeric_dat['Fence'] <- as.numeric(fence_list[comb_data$Fence])
+
+numeric_dat['NewerDwelling'] <- as.numeric(ifelse(comb_data$NewerDwelling == '20', 1, 0))
+
+
+group.prices('GarageFinish')
+
+GarageFin_list <- c('None' = 0,'Unf' = 1, 'RFn' = 1, 'Fin' = 2)
+numeric_dat['GarageFinish'] <- as.numeric(GarageFin_list[comb_data$GarageFinish])
+
+group.prices('HeatingQC')
+heating.list <- c('Po' = 0, 'Fa' = 1, 'TA' = 2, 'Gd' = 3, 'Ex' = 4)
+numeric_dat['HeatingScale'] <- as.numeric(heating.list[comb_data$HeatingQC])
+
+```
+
+With this, categoric features with an ordianl scale have been transformed into a numeric variables. Corelation between the numeric varibale is then assesed. Variables with strong relationship with SalePrice are the focus for modeling so we will focus primarily on features that have a coefficient > .5 or < -.5.
+
+
+```{r corr}
+#Numeric values are selected for corelation matrix
+numeric_cor <- cbind(numeric_dat[1:1460,], train['SalePrice'])
+
+corr_df <- cor(numeric_cor)
+highcor <- as.matrix(sort(corr_df[ ,'SalePrice'], decreasing = TRUE))
+
+corr.idx <- names(which(apply(highcor, 1, function(x) (x > 0.5 | x < -0.5))))
+
+corrplot(as.matrix(corr_df[corr.idx,corr.idx]), method='square', 
+         addCoef.col = 'black', tl.cex = .8,cl.cex = .8, number.cex=.6)
+
+```
+
+From the correlation plot we can see the 10 features with the strongest effect on SalePrice.
+
+ 1.  OverallQual: Overall material and finish quality
+ 2.  GrLivArea: Above grade (ground) living area square feet
+ 3.  GarageCars: Size of garage in car capacity
+ 4.  GarageArea: Size of garage in square feet
+ 5.  TotalBsmtSF: Total square feet of basement area
+ 6.  1stFlrSF: First Floor square feet
+ 7.  YearBuilt: Original construction date
+ 8.  YearRemodAdd: Remodel date
+ 9.  FullBath: Full bathrooms above grade
+ 10. TotRmsAbvGrd: Total rooms above grade (does not include bathrooms)
+
+A strong correlation between GrLivArea and TotRmsAbvGrd is observed since the size of the living area will most likely be a constraint on the number of rooms above ground. An interesting relationship to look into is the relationship between houses with a small living area but many rooms, which will result in smaller rooms and vise versa. Besides, the newer homes will likely give higher listings compared to older models. We can print a matrix of scatter plots to see what these relationships look like under the hood to get a better sense of whats going on.
+
+For the remaining categorical variables dummy variables are created.
+  
+```{r remainingcategoric}
+
+# helper function for plotting categoric data for easier data visualization
+plot.categoric <- function(cols, df){
+  for (col in cols) {
+    order.cols <- names(sort(table(comb_data[,col]), decreasing = TRUE))
+  
+    num.plot <- qplot(df[,col]) +
+      geom_bar(fill = 'cornflowerblue') +
+      geom_text(aes(label = ..count..), stat='count', vjust=-0.5) +
+      theme_minimal() +
+      scale_y_continuous(limits = c(0,max(table(df[,col]))*1.1)) +
+      scale_x_discrete(limits = order.cols) +
+      xlab(col) +
+      theme(axis.text.x = element_text(angle = 30, size=12))
+  
+    print(num.plot)
+  }
+}
+
+
+#The category with the most count is hotencoded as 1 and remaning 0
+plot.categoric('LotShape', comb_data)
+numeric_dat['RegularLotShape'] <- (comb_data$LotShape == 'Reg') * 1
+
+plot.categoric('LandContour', comb_data)
+numeric_dat['LandLeveled'] <- (comb_data$LandContour == 'Lvl') * 1
+
+plot.categoric('LandSlope', comb_data)
+numeric_dat['LandSlopeGentle'] <- (comb_data$LandSlope == 'Gtl') * 1
+
+plot.categoric('Electrical', comb_data)
+numeric_dat['ElectricalSB'] <- (comb_data$Electrical == 'SBrkr') * 1
+
+plot.categoric('GarageType', comb_data)
+numeric_dat['GarageDetchd'] <- (comb_data$GarageType == 'Detchd') * 1
+
+plot.categoric('SaleCondition', comb_data)
+numeric_dat['PartialPlan'] <- (comb_data$SaleCondition == 'Partial') * 1
+```
+
+Dummy variable columns for PavedDrive are hotencoded. Also, for WoodDeckSF, X2ndFlrSF, MasVnrArea values over 0 are encoded as 1 under 'HasX' columns where X are the mentioned variables. For MiscFeature, if the variable has Shed the HasX column is encoded for 1.
+
+```{r remaincat2}
+
+numeric_dat['HasPavedDrive'] <- (comb_data$PavedDrive == 'Y') * 1
+
+numeric_dat['HasWoodDeck'] <- (comb_data$WoodDeckSF > 0) * 1
+
+numeric_dat['Has2ndFlr'] <- (comb_data$X2ndFlrSF > 0) * 1
+
+numeric_dat['HasMasVnr'] <- (comb_data$MasVnrArea > 0) * 1
+
+feature_column<- c('OpenPorchSF','EnclosedPorch', 'X3SsnPorch', 'ScreenPorch')
+
+for (col in feature_column){
+        numeric_dat[str_c('Has',col)] <- (comb_data[,col] !=0) * 1
+        }
+
+
+plot.categoric('MiscFeature', comb_data)
+
+numeric_dat['HasShed'] <- (comb_data$MiscFeature == 'Shed') * 1
+
+
+```
+
+A new column is also created to differentiate the new houses from the remodeled houses. Also, rencently remodeled houses were differentianted in new dummy variable. New column for house sold in the same year it was built were given a new column, because of the 'Hotness' factor.
+
+
+```{r remaincat3}
+
+## New column when the house was not remodeled in the same year as built
+
+numeric_dat['Remodeled'] <- (comb_data$YearBuilt != comb_data$YearRemodAdd) * 1
+
+numeric_dat['RecentRemodel'] <- (comb_data$YearRemodAdd >= comb_data$YrSold) * 1
+
+#New column for house sold in the same year it was built
+
+numeric_dat['NewHouse'] <- (numeric_dat$YearBuilt == numeric_dat$YrSold) * 1
+
+
+```
+
+It is obvious that neigbourhood plays an important role in housing prices. Hence, neighbourhood were hotencoded on a scale of 0 to 4:
+
+ -  0 = MeadowV 
+ -  1 = IDOTRR Sawyer, BrDale , OldTown, Edwards, BrkSide, Blueste
+ -  2 = SWISU, NAmes, NPkVill, Mitchel,SawyerW, Gilbert, NWAmes, Blmngtn, CollgCr
+ -  3 = ClearCr,Crawfor, Veenker, Somerst, Timber
+ -  4 = StoneBr, NoRidge,NridgHt
+
+```{r neighbourhood}
+
+group.prices('Neighborhood')
+
+nbrhood_list <- c('MeadowV' = 0, 'IDOTRR' = 1, 'Sawyer' = 1, 'BrDale' = 1, 'OldTown' = 1, 
+                  'Edwards' = 1, 'BrkSide' = 1, 'Blueste' = 1, 'SWISU' = 2, 
+                  'NAmes' = 2, 'NPkVill' = 2, 'Mitchel' = 2,'SawyerW' = 2, 'Gilbert' = 2,
+                  'NWAmes' = 2, 'Blmngtn' = 2, 'CollgCr' = 2,'ClearCr' = 3,'Crawfor' = 3, 
+                  'Veenker' = 3, 'Somerst' = 3, 'Timber' = 3, 'StoneBr' = 4, 
+                  'NoRidge' = 4,'NridgHt' = 4)
+
+numeric_dat['NeighbourhoodCluster'] <- as.numeric(nbrhood_list[comb_data$Neighborhood])
+```
+
+
+Finally, the remaining categoric variables are encoded using dummy variable function in the caret package.
+
+```{r dummyvars, warning=FALSE}
+
+dummy <- dummyVars(" ~ .",data=comb_data[,numeric==FALSE])
+categoric_dat <- data.frame(predict(dummy,newdata=comb_data[,numeric==FALSE]))
+df <- cbind(numeric_dat, categoric_dat)
+
+```
+
+Variables showing near zero variance
+
+```{r nzv}
+
+nzv_logic <- nearZeroVar(df, saveMetrics = TRUE)
+
+nzv_var <- rownames(nzv_logic)[nzv_logic$nzv==TRUE]
+
+new_df <- df[,!names(df) %in% nzv_var]
+
+```
+
+
+## Dealing With Outliers
+
+The variable GrLivArea and GarageArea are two variables with high correlation with SalePrice. Hence, it would be better to deal with the outliers for these variables
+
+```{r Outliers}
+
+train_dat <- new_df[1:1460, ]
+
+test_dat <- new_df[1461:nrow(new_df),]
+
+boxplot(train_dat$GrLivArea, main = "GrLivArea")
+
+boxplot(train_dat$GarageArea, main = "GarageArea")
+
+# Houses with garage area more 1200SF and grLivArea more than 4000SF are removed because they are gargantuan and their presence is adding skewness to the data.
+
+condition1 <- which(train_dat$GarageArea < 1200 & train_dat$GrLivArea < 4000)
+
+train_dat <- train_dat[1:nrow(train_dat) %in% condition1, ]
+
+#Outliers are also removed from our response variable
+
+y_true <- train$SalePrice[which(1:nrow(train) %in% condition1)]
+
+```
+
+
+##Dealing with Skewness of Response Variable
+
+SalePrice distribution in dataset has been skewed as seen from the distribution plot.
+
+```{r skewreponse}
+
+true_dist <- qplot(y_true, geom = "density") + geom_histogram(aes(y=..density..),fill = "Blue", alpha = .5, bins = 75)+
+        geom_line(aes(y=..density..), color='green', lwd = 1, stat = 'density') +
+        stat_function(fun = dnorm, colour = 'red', lwd = 1, args = 
+                              list(mean(y_true), sd(y_true))) +
+        labs(x = 'SalePrice') + ggtitle("Distribution of Sale Price") + 
+        annotate('text', label = paste('skewness =', signif(skewness(y_true),3)),
+                 x=6e+05,y=7.5e-06)
+
+print(true_dist)
+
+```
+
+To deal with the skewness, log(SalePrice +1) is taken. This solves the skewness problem.
+
+```{r unskewresponse}
+
+y_train <-log(y_true+1)
+
+
+train_dist <- qplot(y_train, geom = "density") + 
+        geom_histogram(aes(y=..density..), fill = "Blue", alpha = .5, bins = 75)+
+        geom_line(aes(y=..density..), color='green', lwd = 1, stat = 'density') +
+        stat_function(fun = dnorm, colour = 'red', lwd = 1, args = 
+                              list(mean(y_train), sd(y_train))) +
+        labs(x = 'log(SalePrice + 1)') + ggtitle("Distribution of Log(Sale Price + 1)") + 
+        annotate('text', label = paste('skewness =', signif(skewness(y_train),3)),
+                 x=13,y=1.2)
+
+
+
+grid.arrange(true_dist, train_dist, ncol = 2 )
+
+```
+
+
+#Modeling
+
+With the feature engineering complete and the data ready, regularization, XGBoosting were used for predicting the housing prices.
+
+```{r XGBoost, message=FALSE, include=FALSE, cache=TRUE}
+
+#XGBoost has its own function to create matrix for the modeling
+
+dtrain <- xgb.DMatrix(as.matrix(train_dat), label = y_train)
+dtest <- xgb.DMatrix(as.matrix(test_dat))
+
+
+cv.ctrl <- trainControl(method = "repeatedcv", repeats = 1,number = 4, 
+                        allowParallel=T)
+
+xgb.grid <- expand.grid(nrounds = 750,
+                        eta = c(0.01,0.005,0.001),
+                        max_depth = c(4,6,8),
+                        colsample_bytree=c(0,1,10),
+                        min_child_weight = 2,
+                        subsample=c(0,0.2,0.4,0.6),
+                        gamma=0.01)
+
+set.seed(53)
+
+xgb_tune <- train(as.matrix(train_dat),
+                  y_train, method="xgbTree", 
+                  trControl=cv.ctrl, 
+                  tuneGrid=xgb.grid, 
+                  verbose=T, metric="RMSE", nthread =3)
+
+xgb_params <- list(
+        booster = 'gbtree',
+        objective = 'reg:linear',
+        colsample_bytree=1,
+        eta=0.01,
+        max_depth=8,
+        min_child_weight=3,
+        alpha=0.3,
+        lambda=0.4,
+        gamma=0.01, # less overfit
+        subsample=0.4,
+        seed=5,
+        silent=TRUE)
+
+xgb.cv(xgb_params, dtrain, nrounds = 5000, nfold = 4, early_stopping_rounds = 500)
+
+bst <- xgb.train(xgb_params,dtrain, nrounds = 10000, early_stopping_rounds = 300, watchlist = list(train=dtrain))
+
+```
+
+To test how well the model has done the RMSE value is calculated.
+
+```{r RMSE}
+# Functtion to calculate the RMSE value
+rmse_eval <- function(y.true, y.pred) {
+  mse_eval <- sum((y.true - exp(y.pred)-1)^2) / length(y.true)
+  return(sqrt(mse_eval))
+}
+
+y_pred.xgb <- predict(bst, dtrain)
+rmse_eval(y_true, y_pred.xgb)
+```
+
+XGBoost has an extremely useful function called xgb.plot.importance, which plots the feature importance of the model.
+
+Feature importance is computed by averaging the gain of each feature for all split and all trees in the model. We can take a look at the 10 most important features used in our model. Also, predict the SalePrice on our test data is calculated as well.
+
+```{r XGB Predict}
+
+model.names <- dimnames(dtrain)[[2]]
+
+importance_matrix <- xgb.importance(model.names, model = bst)
+
+#Plotting 10 most important feature that contribute to the model
+xgb.plot.importance(importance_matrix[1:10])
+
+
+pred.xgb <- predict(bst, as.matrix(test_dat))
+
+xgb.SalePrice <- as.data.frame(exp(pred.xgb)-1)
+
+colnames(xgb.SalePrice) <- c("1")
+
+```
+
+
+One limitation to using GBM’s and XGBoost in particular is its inability to extrapolate and because of this linear model can better predict any sale prices outside the range of prices given in our training set. Hence, regularized linear models are used with penalty term lambda to minimize the error. Ridge, Lasso and Elastic Net regularization is ensembled.
+
+```{r Regularization, echo=TRUE}
+
+#For regularization, a matrix is generated
+
+x <- train_dat %>% data.matrix()
+
+# a range of lambdas are generated over which regularization can be tested
+lamdas <- 10^seq(3, -2, by = -.1)
+
+#cv.glm net provides the optimum lambda for regularization
+
+glm.cv.ridge <- cv.glmnet(x, y_train, alpha = 0, lambda = lamdas)
+glm.cv.lasso <- cv.glmnet(x, y_train, alpha = 1, lambda = lamdas)
+glm.cv.net <- cv.glmnet(x, y_train, alpha = 0.01, lambda = lamdas)
+
+par(mfrow=c(1,3))
+
+plot(glm.cv.ridge, main = "Ridge")
+plot(glm.cv.lasso, main = "Lasso")
+plot(glm.cv.net, main = "Elastic Net")
+
+
+#The the minimum value is optimum lambda 
+penalty.ridge <- glm.cv.ridge$lambda.min
+penalty.lasso <- glm.cv.lasso$lambda.min
+penalty.net <- glm.cv.net$lambda.min
+
+
+pred.ridge <- predict(glm.cv.ridge, s = penalty.ridge, newx = data.matrix(test_dat))
+ridge.SalePrice <- as.data.frame(exp(pred.ridge)-1)
+pred.lasso <- predict(glm.cv.lasso, s = penalty.lasso, newx = data.matrix(test_dat))
+lasso.SalePrice <- as.data.frame(exp(pred.lasso)-1)
+pred.net <- predict(glm.cv.net, s = penalty.net, newx = data.matrix(test_dat))
+net.SalePrice <- as.data.frame(exp(pred.net)-1)
+
+
+#Random forest was also used to see how well the prediction worked. However it yielded bad results compared to gradient boosting and regularization ensembles
+
+#model_rf <- randomForest(y_train ~ ., data = train_dat)
+#pred.rf <- predict(model_rf, test_dat)
+#rf.SalePrice <- as.data.frame(exp(pred.net)-1)
+
+SalePrice <- (xgb.SalePrice + ridge.SalePrice + lasso.SalePrice + net.SalePrice)/4.0
+
+PredictedPrice <- cbind(test['Id'], SalePrice$`1`)
+
+colnames(PredictedPrice) <- c("Id", "SalePrice")
+
+write.csv(PredictedPrice, file = "PredictedPrice.csv", row.names = F)
+
+```
+
+
+#Conclusion
+
+This report elaborated on the details of how the house prices were predicted. Missing data was first imputed, then new features were engineers that could be fed into the model. A combination of XGBoost (Gradient Boosting) and regularization techniques was used to create the model.
+
+
