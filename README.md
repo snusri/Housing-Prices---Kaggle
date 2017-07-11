@@ -4,7 +4,7 @@ Housing Price Prediction - Kaggle Competition
 
 This repo contains R scripts for the feature engineering and modeling of the kaggle competition dataset to predict Boston's house prices.
 
-For full report visit [article] (http://rpubs.com/saeed_nusri/290664) on RPubs
+For full report visit [article](http://rpubs.com/saeed_nusri/290664) on RPubs
 
 The report presents the analysis and modeling done on the House Pricing dataset provided on Kaggle for advanced regression technique.
 
